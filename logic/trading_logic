@@ -1,0 +1,814 @@
+"""
+VOLGUARD v31.0 – TRADING LOGIC
+==============================
+The Brain - Strategy Selection, Strike Selection, Position Sizing
+Professional trading logic with comprehensive strategy implementation
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from datetime import date
+from colorama import Fore, Style
+
+@dataclass
+class Position:
+    """Complete position tracking"""
+    position_id: str
+    structure: str
+    entry_date: date
+    entry_time: str
+    expiry_date: date
+    dte_at_entry: int
+    strikes: Dict
+    lots: int
+    lot_size: int
+    entry_premium: float
+    entry_vix: float
+    entry_spot: float
+    current_premium: float = 0.0
+    current_spot: float = 0.0
+    current_vix: float = 0.0
+    current_dte: int = 0
+    unrealized_pnl: float = 0.0
+    pnl_pct: float = 0.0
+    net_delta: float = 0.0
+    gamma: float = 0.0
+    theta_daily: float = 0.0
+    vega: float = 0.0
+    prob_profit: float = 0.0
+    status: str = "OPEN"
+    adjustments: List[Dict] = field(default_factory=list)
+    alerts_triggered: List[str] = field(default_factory=list)
+    last_check: Optional[datetime] = None
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY SELECTION ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+class StrategySelector:
+    """Professional strategy selection based on regime and market conditions"""
+    
+    @staticmethod
+    def select_strategy(regime_name: str, expiry_type: str, dte: int,
+                       vol_metrics, struct_metrics, edge_metrics,
+                       external_metrics) -> Tuple[str, callable]:
+        """Select optimal strategy for current conditions"""
+        
+        if expiry_type == "WEEKLY":
+            if regime_name == "AGGRESSIVE_SHORT":
+                if dte <= 2:
+                    return "IRON_BUTTERFLY", StrikeSelector.short_iron_butterfly_weekly
+                elif dte >= 5:
+                    return "IRON_CONDOR", StrikeSelector.short_iron_condor_weekly
+                else:
+                    if struct_metrics.gex_regime == "STICKY":
+                        return "IRON_BUTTERFLY", StrikeSelector.short_iron_butterfly_weekly
+                    else:
+                        return "IRON_CONDOR", StrikeSelector.short_iron_condor_weekly
+            
+            elif regime_name == "MODERATE_SHORT":
+                return "IRON_CONDOR", StrikeSelector.short_iron_condor_weekly
+            
+            elif regime_name == "DEFENSIVE":
+                if struct_metrics.skew_regime == "CRASH_FEAR":
+                    return "CALL_CREDIT_SPREAD", StrikeSelector.call_credit_spread_weekly
+                elif struct_metrics.skew_regime == "MELT_UP":
+                    return "PUT_CREDIT_SPREAD", StrikeSelector.put_credit_spread_weekly
+                else:
+                    return "PUT_CREDIT_SPREAD", StrikeSelector.put_credit_spread_weekly
+            
+            else:  # CASH
+                return "NONE", None
+        
+        elif expiry_type == "MONTHLY":
+            if regime_name == "AGGRESSIVE_SHORT":
+                if edge_metrics.term_regime == "BACKWARDATION" and edge_metrics.term_spread < -2.0:
+                    return "CALENDAR_SPREAD", StrikeSelector.calendar_spread_monthly
+                else:
+                    return "IRON_CONDOR", StrikeSelector.short_iron_condor_monthly
+            
+            elif regime_name == "MODERATE_SHORT":
+                if struct_metrics.pcr_atm > 1.3:
+                    return "BROKEN_WING_BUTTERFLY", StrikeSelector.broken_wing_butterfly_monthly
+                elif struct_metrics.pcr_atm < 0.7:
+                    return "BROKEN_WING_BUTTERFLY", StrikeSelector.broken_wing_butterfly_monthly
+                else:
+                    return "IRON_CONDOR", StrikeSelector.short_iron_condor_monthly
+            
+            elif regime_name == "DEFENSIVE":
+                return "JADE_LIZARD", StrikeSelector.jade_lizard_monthly
+            
+            else:  # CASH
+                return "NONE", None
+        
+        return "NONE", None
+
+# ═══════════════════════════════════════════════════════════════════
+# STRIKE SELECTION ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+class StrikeSelector:
+    """Professional strike selection for all strategies"""
+    
+    @staticmethod
+    def calculate_strike_probability(spot: float, iv: float, dte: int, strike: float) -> float:
+        """Calculate probability of strike being ITM at expiry using Black-Scholes"""
+        if dte <= 0 or iv <= 0 or spot <= 0:
+            return 0.0
+        
+        t = dte / 365.0
+        sigma = iv / 100.0
+        d2 = (np.log(spot / strike)) / (sigma * np.sqrt(t)) - 0.5 * sigma * np.sqrt(t)
+        
+        if strike > spot:  # Call
+            prob_itm = 1 - norm.cdf(d2)
+        else:  # Put
+            prob_itm = norm.cdf(d2)
+        
+        return prob_itm * 100
+    
+    @staticmethod
+    def get_delta_strike(chain: pd.DataFrame, spot: float, target_delta: float, 
+                        option_type: str) -> Tuple[float, Dict]:
+        """Get strike closest to target delta"""
+        if option_type == "CE":
+            candidates = chain[chain['strike'] > spot].copy()
+            candidates['delta_diff'] = (candidates['ce_delta'].abs() - abs(target_delta)).abs()
+            best_idx = candidates['delta_diff'].argsort()[:1]
+            strike = candidates.iloc[best_idx]['strike'].values[0]
+            row = candidates[candidates['strike'] == strike].iloc[0]
+            return strike, {
+                'strike': strike,
+                'premium': row['ce_ltp'],
+                'iv': row['ce_iv'],
+                'delta': row['ce_delta'],
+                'gamma': row['ce_gamma']
+            }
+        else:  # PE
+            candidates = chain[chain['strike'] < spot].copy()
+            candidates['delta_diff'] = (candidates['pe_delta'].abs() - abs(target_delta)).abs()
+            best_idx = candidates['delta_diff'].argsort()[:1]
+            strike = candidates.iloc[best_idx]['strike'].values[0]
+            row = candidates[candidates['strike'] == strike].iloc[0]
+            return strike, {
+                'strike': strike,
+                'premium': row['pe_ltp'],
+                'iv': row['pe_iv'],
+                'delta': row['pe_delta'],
+                'gamma': row['pe_gamma']
+            }
+    
+    # WEEKLY STRATEGIES
+    @staticmethod
+    def short_iron_condor_weekly(chain: pd.DataFrame, spot: float, dte: int) -> Dict:
+        """SHORT IRON CONDOR (Weekly)"""
+        # Short strikes (16 delta each side)
+        call_short_strike, call_short = StrikeSelector.get_delta_strike(chain, spot, 0.16, "CE")
+        put_short_strike, put_short = StrikeSelector.get_delta_strike(chain, spot, -0.16, "PE")
+        
+        # Long strikes (5 delta each side for protection)
+        call_long_strike, call_long = StrikeSelector.get_delta_strike(chain, spot, 0.05, "CE")
+        put_long_strike, put_long = StrikeSelector.get_delta_strike(chain, spot, -0.05, "PE")
+        
+        # Premium calculation
+        call_spread_credit = call_short['premium'] - call_long['premium']
+        put_spread_credit = put_short['premium'] - put_long['premium']
+        net_credit = call_spread_credit + put_spread_credit
+        
+        # Risk calculation
+        call_spread_width = call_long_strike - call_short_strike
+        put_spread_width = put_short_strike - put_long_strike
+        max_risk = max(call_spread_width, put_spread_width) - net_credit
+        
+        return {
+            "structure": "IRON_CONDOR",
+            "expiry_type": "WEEKLY",
+            "ideal_dte": "3-5 days",
+            "regime": "MODERATE_SHORT",
+            "call_short": call_short_strike,
+            "call_long": call_long_strike,
+            "put_short": put_short_strike,
+            "put_long": put_long_strike,
+            "net_credit": net_credit,
+            "max_risk": max_risk,
+            "risk_reward": max_risk / net_credit if net_credit > 0 else 999,
+            "breakeven_up": call_short_strike + net_credit,
+            "breakeven_down": put_short_strike - net_credit,
+            "prob_profit": 68.0,
+            "lots": 1
+        }
+    
+    @staticmethod
+    def short_iron_butterfly_weekly(chain: pd.DataFrame, spot: float, dte: int) -> Dict:
+        """SHORT IRON BUTTERFLY (Weekly)"""
+        # ATM strikes (closest to spot)
+        atm_strike = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]['strike'].values[0]
+        atm_row = chain[chain['strike'] == atm_strike].iloc[0]
+        
+        # Short ATM
+        call_short_premium = atm_row['ce_ltp']
+        put_short_premium = atm_row['pe_ltp']
+        short_premium = call_short_premium + put_short_premium
+        
+        # Long strikes (2.5x premium away)
+        target_distance = short_premium * 2.5
+        
+        call_long_strike = chain.iloc[(chain['strike'] - (atm_strike + target_distance)).abs().argsort()[:1]]['strike'].values[0]
+        put_long_strike = chain.iloc[(chain['strike'] - (atm_strike - target_distance)).abs().argsort()[:1]]['strike'].values[0]
+        
+        call_long_premium = chain[chain['strike'] == call_long_strike].iloc[0]['ce_ltp']
+        put_long_premium = chain[chain['strike'] == put_long_strike].iloc[0]['pe_ltp']
+        
+        net_credit = short_premium - (call_long_premium + put_long_premium)
+        
+        # Max risk
+        call_width = call_long_strike - atm_strike
+        put_width = atm_strike - put_long_strike
+        max_risk = max(call_width, put_width) - net_credit
+        
+        return {
+            "structure": "IRON_BUTTERFLY",
+            "expiry_type": "WEEKLY",
+            "ideal_dte": "2-4 days",
+            "regime": "AGGRESSIVE_SHORT",
+            "atm_strike": atm_strike,
+            "call_long": call_long_strike,
+            "put_long": put_long_strike,
+            "net_credit": net_credit,
+            "max_risk": max_risk,
+            "risk_reward": max_risk / net_credit if net_credit > 0 else 999,
+            "breakeven_up": atm_strike + net_credit,
+            "breakeven_down": atm_strike - net_credit,
+            "prob_profit": 65.0,
+            "lots": 1
+        }
+    
+    @staticmethod
+    def put_credit_spread_weekly(chain: pd.DataFrame, spot: float, dte: int) -> Dict:
+        """PUT CREDIT SPREAD (Weekly)"""
+        # Short put (20 delta)
+        put_short_strike, put_short = StrikeSelector.get_delta_strike(chain, spot, -0.20, "PE")
+        
+        # Long put (10 delta)
+        put_long_strike, put_long = StrikeSelector.get_delta_strike(chain, spot, -0.10, "PE")
+        
+        net_credit = put_short['premium'] - put_long['premium']
+        spread_width = put_short_strike - put_long_strike
+        max_risk = spread_width - net_credit
+        
+        return {
+            "structure": "PUT_CREDIT_SPREAD",
+            "expiry_type": "WEEKLY",
+            "ideal_dte": "3-7 days",
+            "regime": "DEFENSIVE",
+            "put_short": put_short_strike,
+            "put_long": put_long_strike,
+            "net_credit": net_credit,
+            "max_risk": max_risk,
+            "risk_reward": max_risk / net_credit if net_credit > 0 else 999,
+            "breakeven": put_short_strike - net_credit,
+            "prob_profit": 80.0,
+            "lots": 1
+        }
+    
+    @staticmethod
+    def call_credit_spread_weekly(chain: pd.DataFrame, spot: float, dte: int) -> Dict:
+        """CALL CREDIT SPREAD (Weekly)"""
+        # Short call (20 delta)
+        call_short_strike, call_short = StrikeSelector.get_delta_strike(chain, spot, 0.20, "CE")
+        
+        # Long call (10 delta)
+        call_long_strike, call_long = StrikeSelector.get_delta_strike(chain, spot, 0.10, "CE")
+        
+        net_credit = call_short['premium'] - call_long['premium']
+        spread_width = call_long_strike - call_short_strike
+        max_risk = spread_width - net_credit
+        
+        return {
+            "structure": "CALL_CREDIT_SPREAD",
+            "expiry_type": "WEEKLY",
+            "ideal_dte": "3-7 days",
+            "regime": "DEFENSIVE",
+            "call_short": call_short_strike,
+            "call_long": call_long_strike,
+            "net_credit": net_credit,
+            "max_risk": max_risk,
+            "risk_reward": max_risk / net_credit if net_credit > 0 else 999,
+            "breakeven": call_short_strike + net_credit,
+            "prob_profit": 80.0,
+            "lots": 1
+        }
+    
+    # MONTHLY STRATEGIES
+    @staticmethod
+    def short_iron_condor_monthly(chain: pd.DataFrame, spot: float, dte: int) -> Dict:
+        """SHORT IRON CONDOR (Monthly)"""
+        # Short strikes (20 delta - more conservative than weekly)
+        call_short_strike, call_short = StrikeSelector.get_delta_strike(chain, spot, 0.20, "CE")
+        put_short_strike, put_short = StrikeSelector.get_delta_strike(chain, spot, -0.20, "PE")
+        
+        # Long strikes (8 delta)
+        call_long_strike, call_long = StrikeSelector.get_delta_strike(chain, spot, 0.08, "CE")
+        put_long_strike, put_long = StrikeSelector.get_delta_strike(chain, spot, -0.08, "PE")
+        
+        call_spread_credit = call_short['premium'] - call_long['premium']
+        put_spread_credit = put_short['premium'] - put_long['premium']
+        net_credit = call_spread_credit + put_spread_credit
+        
+        call_spread_width = call_long_strike - call_short_strike
+        put_spread_width = put_short_strike - put_long_strike
+        max_risk = max(call_spread_width, put_spread_width) - net_credit
+        
+        return {
+            "structure": "IRON_CONDOR",
+            "expiry_type": "MONTHLY",
+            "ideal_dte": "14-21 days",
+            "regime": "MODERATE_SHORT",
+            "call_short": call_short_strike,
+            "call_long": call_long_strike,
+            "put_short": put_short_strike,
+            "put_long": put_long_strike,
+            "net_credit": net_credit,
+            "max_risk": max_risk,
+            "risk_reward": max_risk / net_credit if net_credit > 0 else 999,
+            "breakeven_up": call_short_strike + net_credit,
+            "breakeven_down": put_short_strike - net_credit,
+            "prob_profit": 64.0,
+            "lots": 1
+        }
+    
+    @staticmethod
+    def broken_wing_butterfly_monthly(chain: pd.DataFrame, spot: float, dte: int,
+                                     bias: str = "NEUTRAL") -> Dict:
+        """BROKEN WING BUTTERFLY (Monthly)"""
+        # ATM
+        atm_strike = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]['strike'].values[0]
+        atm_put_premium = chain[chain['strike'] == atm_strike].iloc[0]['pe_ltp']
+        
+        # Short 2x ATM
+        short_premium = atm_put_premium * 2
+        
+        # Buy closer OTM (1.5x premium away)
+        near_distance = atm_put_premium * 1.5
+        near_strike = chain.iloc[(chain['strike'] - (atm_strike - near_distance)).abs().argsort()[:1]]['strike'].values[0]
+        near_premium = chain[chain['strike'] == near_strike].iloc[0]['pe_ltp']
+        
+        # Buy farther OTM (3x premium away)
+        far_distance = atm_put_premium * 3
+        far_strike = chain.iloc[(chain['strike'] - (atm_strike - far_distance)).abs().argsort()[:1]]['strike'].values[0]
+        far_premium = chain[chain['strike'] == far_strike].iloc[0]['pe_ltp']
+        
+        net_credit = short_premium - (near_premium + far_premium)
+        
+        # Max risk (on downside)
+        max_risk_down = (atm_strike - near_strike) - net_credit
+        
+        return {
+            "structure": "BROKEN_WING_BUTTERFLY",
+            "expiry_type": "MONTHLY",
+            "ideal_dte": "14-28 days",
+            "regime": "MODERATE_SHORT",
+            "bias": bias,
+            "atm_strike": atm_strike,
+            "near_long": near_strike,
+            "far_long": far_strike,
+            "net_credit": net_credit,
+            "max_risk": max_risk_down,
+            "risk_reward": max_risk_down / net_credit if net_credit > 0 else 999,
+            "prob_profit": 62.0,
+            "lots": 1
+        }
+    
+    @staticmethod
+    def calendar_spread_monthly(chain: pd.DataFrame, monthly_chain: pd.DataFrame,
+                               spot: float, dte_short: int, dte_long: int) -> Dict:
+        """CALENDAR SPREAD (Monthly)"""
+        # ATM strike
+        atm_strike = chain.iloc[(chain['strike'] - spot).abs().argsort()[:1]]['strike'].values[0]
+        
+        # Short weekly ATM
+        short_premium = chain[chain['strike'] == atm_strike].iloc[0]['ce_ltp']
+        
+        # Long monthly ATM
+        long_premium = monthly_chain[monthly_chain['strike'] == atm_strike].iloc[0]['ce_ltp']
+        
+        net_debit = long_premium - short_premium
+        
+        return {
+            "structure": "CALENDAR_SPREAD",
+            "expiry_type": "MONTHLY",
+            "ideal_dte": "Weekly: 3-7, Monthly: 21-28",
+            "regime": "BACKWARDATION",
+            "strike": atm_strike,
+            "short_dte": dte_short,
+            "long_dte": dte_long,
+            "net_debit": net_debit,
+            "max_risk": net_debit,
+            "max_profit": "Unlimited (IV expansion + theta)",
+            "prob_profit": 55.0,
+            "lots": 1
+        }
+    
+    @staticmethod
+    def jade_lizard_monthly(chain: pd.DataFrame, spot: float, dte: int) -> Dict:
+        """JADE LIZARD (Monthly)"""
+        # Call spread
+        call_short_strike, call_short = StrikeSelector.get_delta_strike(chain, spot, 0.25, "CE")
+        call_long_strike, call_long = StrikeSelector.get_delta_strike(chain, spot, 0.15, "CE")
+        
+        # Naked put
+        put_short_strike, put_short = StrikeSelector.get_delta_strike(chain, spot, -0.20, "PE")
+        
+        call_spread_credit = call_short['premium'] - call_long['premium']
+        put_credit = put_short['premium']
+        total_credit = call_spread_credit + put_credit
+        
+        # Upside risk = 0 if credit > call spread width
+        call_spread_width = call_long_strike - call_short_strike
+        upside_risk = max(0, call_spread_width - total_credit)
+        
+        return {
+            "structure": "JADE_LIZARD",
+            "expiry_type": "MONTHLY",
+            "ideal_dte": "14-28 days",
+            "regime": "MODERATE_SHORT",
+            "bias": "BULLISH",
+            "call_short": call_short_strike,
+            "call_long": call_long_strike,
+            "put_short": put_short_strike,
+            "total_credit": total_credit,
+            "upside_risk": upside_risk,
+            "downside_risk": "UNDEFINED",
+            "breakeven_down": put_short_strike - total_credit,
+            "prob_profit": 70.0,
+            "lots": 1
+        }
+
+# ═══════════════════════════════════════════════════════════════════
+# POSITION SIZING ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+class PositionSizer:
+    """Kelly criterion-based position sizing"""
+    
+    def __init__(self, total_capital: float, max_portfolio_risk: float = 0.20):
+        self.capital = total_capital
+        self.max_portfolio_risk = max_portfolio_risk
+    
+    def calculate_position_size(self, trade_spec: Dict, regime_score: float,
+                               regime_confidence: str, win_rate: float = 0.68) -> Dict:
+        """Calculate optimal position size using Kelly criterion"""
+        
+        # Estimate max risk
+        if trade_spec['max_risk'] == "UNDEFINED":
+            # For strangle: use 8:1 loss ratio
+            estimated_max_risk = trade_spec['total_premium'] * 8
+        else:
+            estimated_max_risk = trade_spec['max_risk']
+        
+        avg_win = trade_spec.get('net_credit', trade_spec.get('total_premium', 0))
+        avg_loss = estimated_max_risk
+        
+        # Kelly fraction
+        win_prob = win_rate
+        loss_prob = 1 - win_rate
+        
+        kelly_fraction = (win_prob * avg_win - loss_prob * avg_loss) / avg_loss
+        kelly_fraction = max(0, kelly_fraction)
+        
+        # Regime confidence adjustment
+        if regime_confidence == "VERY_HIGH":
+            kelly_multiplier = 0.50
+        elif regime_confidence == "HIGH":
+            kelly_multiplier = 0.35
+        elif regime_confidence == "MODERATE":
+            kelly_multiplier = 0.25
+        else:
+            kelly_multiplier = 0.10
+        
+        adjusted_kelly = kelly_fraction * kelly_multiplier
+        
+        # Composite score scaling
+        score_scaling = regime_score / 10.0
+        final_kelly = adjusted_kelly * score_scaling
+        
+        # Capital to risk
+        capital_to_risk = self.capital * final_kelly
+        
+        # Calculate lots
+        if trade_spec['max_risk'] == "UNDEFINED":
+            margin_per_lot = 125000  # Base SPAN margin
+            max_lots = int(capital_to_risk / margin_per_lot)
+        else:
+            risk_per_lot = trade_spec['max_risk']
+            max_lots = int(capital_to_risk / risk_per_lot)
+        
+        # Portfolio risk cap (20% max)
+        portfolio_cap = self.capital * self.max_portfolio_risk
+        if trade_spec['max_risk'] != "UNDEFINED":
+            max_lots_from_cap = int(portfolio_cap / trade_spec['max_risk'])
+            max_lots = min(max_lots, max_lots_from_cap)
+        
+        # Minimum 1 lot
+        max_lots = max(1, max_lots) if max_lots > 0 else 0
+        
+        # Liquidity cap (max 10 lots for Nifty)
+        max_lots = min(max_lots, 10)
+        
+        return {
+            "lots": max_lots,
+            "capital_allocated": max_lots * (margin_per_lot if trade_spec['max_risk'] == "UNDEFINED" else trade_spec['max_risk']),
+            "kelly_fraction": kelly_fraction,
+            "adjusted_kelly": final_kelly,
+            "risk_per_lot": estimated_max_risk if trade_spec['max_risk'] == "UNDEFINED" else trade_spec['max_risk'],
+            "total_risk": max_lots * (estimated_max_risk if trade_spec['max_risk'] == "UNDEFINED" else trade_spec['max_risk']),
+            "expected_premium": max_lots * avg_win * 50,
+            "win_rate_assumed": win_rate,
+            "confidence_level": regime_confidence
+        }
+
+# ═══════════════════════════════════════════════════════════════════
+# POSITION MONITOR
+# ═══════════════════════════════════════════════════════════════════
+
+class PositionMonitor:
+    """Monitor open positions and check exit conditions"""
+    
+    def __init__(self):
+        self.positions = {}
+        self.alerts = []
+    
+    def add_position(self, position_data: Dict):
+        """Add new position to monitor"""
+        position = Position(**position_data)
+        self.positions[position.position_id] = position
+        print(f"✅ Position {position.position_id} added to monitor")
+    
+    def update_position_metrics(self, instrument_key: str, current_data: Dict):
+        """Update position with current market data"""
+        # Find position by instrument key (simplified - in production use proper mapping)
+        for position in self.positions.values():
+            if position.status == "OPEN":
+                # Update current state
+                position.current_premium = current_data.get('current_premium', 0)
+                position.current_spot = current_data.get('current_spot', position.current_spot)
+                position.current_vix = current_data.get('current_vix', position.current_vix)
+                position.current_dte = (position.expiry_date - date.today()).days
+                
+                # Calculate P&L
+                if position.structure in ["SHORT_STRANGLE", "SHORT_IRON_CONDOR", "SHORT_STRADDLE"]:
+                    position.unrealized_pnl = (position.entry_premium - position.current_premium) * position.lots * position.lot_size
+                else:
+                    position.unrealized_pnl = (position.current_premium - position.entry_premium) * position.lots * position.lot_size
+                
+                position.pnl_pct = (position.unrealized_pnl / (position.entry_premium * position.lots * position.lot_size)) * 100
+                
+                # Update Greeks
+                greeks = current_data.get('greeks', {})
+                position.net_delta = greeks.get('delta', 0) * position.lots
+                position.gamma = greeks.get('gamma', 0) * position.lots
+                position.theta_daily = greeks.get('theta', 0) * position.lots * position.lot_size
+                position.vega = greeks.get('vega', 0) * position.lots * position.lot_size
+                
+                # Update probabilities
+                position.prob_profit = current_data.get('prob_profit', 50.0)
+                
+                position.last_check = datetime.now()
+    
+    def check_exit_conditions(self, position_id: str) -> Optional[Dict]:
+        """Check if position should be exited"""
+        if position_id not in self.positions:
+            return None
+        
+        position = self.positions[position_id]
+        
+        if position.status != "OPEN":
+            return None
+        
+        exit_signals = []
+        
+        # RULE 1: PROFIT TARGET (50%)
+        if position.pnl_pct >= 50:
+            exit_signals.append({
+                "trigger": "PROFIT_TARGET",
+                "severity": "IMMEDIATE",
+                "reason": f"Profit {position.pnl_pct:.1f}% ≥ 50% target",
+                "action": "CLOSE_FULL_POSITION"
+            })
+        
+        # RULE 2: STOP LOSS
+        if position.structure in ["SHORT_STRANGLE", "SHORT_STRADDLE"]:
+            stop_loss_pct = -200
+        else:
+            stop_loss_pct = -80
+        
+        if position.pnl_pct <= stop_loss_pct:
+            exit_signals.append({
+                "trigger": "STOP_LOSS",
+                "severity": "IMMEDIATE",
+                "reason": f"Loss {position.pnl_pct:.1f}% ≤ {stop_loss_pct}%",
+                "action": "CLOSE_FULL_POSITION"
+            })
+        
+        # RULE 3: TIME-BASED (50% theta)
+        theta_realized = (position.dte_at_entry - position.current_dte) / position.dte_at_entry
+        if theta_realized >= 0.50:
+            exit_signals.append({
+                "trigger": "THETA_TARGET",
+                "severity": "NORMAL",
+                "reason": f"50% theta realized ({theta_realized:.1%})",
+                "action": "CLOSE_FULL_POSITION"
+            })
+        
+        # RULE 4: DTE-BASED (gamma danger)
+        if position.structure in ["SHORT_STRANGLE", "SHORT_STRADDLE"]:
+            if position.current_dte <= 1:
+                exit_signals.append({
+                    "trigger": "GAMMA_DANGER",
+                    "severity": "IMMEDIATE",
+                    "reason": f"DTE {position.current_dte} - gamma explosion risk",
+                    "action": "CLOSE_FULL_POSITION"
+                })
+        
+        # RULE 5: DELTA BREACH
+        if abs(position.net_delta) > 0.15:
+            exit_signals.append({
+                "trigger": "DELTA_BREACH",
+                "severity": "HIGH",
+                "reason": f"Net delta {position.net_delta:.2f} exceeds ±0.15",
+                "action": "CLOSE_FULL_POSITION"
+            })
+        
+        # RULE 6: VIX SPIKE
+        vix_change_pct = ((position.current_vix - position.entry_vix) / position.entry_vix) * 100
+        if vix_change_pct > 20:
+            exit_signals.append({
+                "trigger": "VIX_SPIKE",
+                "severity": "IMMEDIATE",
+                "reason": f"VIX spiked {vix_change_pct:+.1f}% from entry",
+                "action": "CLOSE_FULL_POSITION"
+            })
+        
+        # RULE 7: PROBABILITY INVERSION
+        if position.prob_profit < 40:
+            exit_signals.append({
+                "trigger": "PROBABILITY_INVERSION",
+                "severity": "HIGH",
+                "reason": f"Prob of profit dropped to {position.prob_profit:.1f}%",
+                "action": "CLOSE_FULL_POSITION"
+            })
+        
+        # Return highest severity signal
+        if exit_signals:
+            exit_signals.sort(key=lambda x: {"IMMEDIATE": 3, "HIGH": 2, "NORMAL": 1}[x['severity']], reverse=True)
+            return exit_signals[0]
+        
+        return None
+    
+    def monitor_all_positions(self):
+        """Main monitoring loop - check all open positions"""
+        print(f"\n{'='*80}")
+        print(f"📊 POSITION MONITORING - {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{'='*80}\n")
+        
+        open_positions = [p for p in self.positions.values() if p.status == "OPEN"]
+        
+        if not open_positions:
+            print("  No open positions")
+            return
+        
+        for position in open_positions:
+            print(f"Position: {position.position_id}")
+            print(f"  Structure: {position.structure} | DTE: {position.current_dte}")
+            print(f"  P&L: ₹{position.unrealized_pnl:+,.0f} ({position.pnl_pct:+.1f}%)")
+            print(f"  Greeks: Δ={position.net_delta:+.2f} | Θ=₹{position.theta_daily:+,.0f}/day")
+            
+            # Check exit conditions
+            exit_signal = self.check_exit_conditions(position.position_id)
+            
+            if exit_signal:
+                print(f"  🚨 EXIT SIGNAL: {exit_signal['trigger']}")
+                print(f"     {exit_signal['reason']}")
+                print(f"     Action: {exit_signal['action']}")
+                
+                # Add to alerts
+                self.alerts.append({
+                    "timestamp": datetime.now(),
+                    "position_id": position.position_id,
+                    "signal": exit_signal
+                })
+            else:
+                print(f"  ✓ No exit triggers")
+            
+            print()
+    
+    def close_position(self, position_id: str, exit_reason: str):
+        """Mark position as closed"""
+        if position_id in self.positions:
+            self.positions[position_id].status = "CLOSED"
+            print(f"✅ Position {position_id} marked as CLOSED")
+            print(f"   Reason: {exit_reason}")
+
+# ═══════════════════════════════════════════════════════════════════
+# ORDER EXECUTOR (Template for reference)
+# ═════════════════════════════════
+"""
+ORDER EXECUTOR (Template for reference)
+This is now handled by UpstoxExecutionEngine in engines/execution_engine.py
+"""
+
+class OrderExecutor:
+    """Legacy template - now use UpstoxExecutionEngine"""
+    pass
+
+# ═══════════════════════════════════════════════════════════════════
+# EXAMPLE USAGE
+# ═══════════════════════════════════════════════════════════════════
+
+def example_usage():
+    """Example of how to use the trading logic"""
+    
+    print("\n" + "="*80)
+    print("EXAMPLE: Complete Trading Workflow")
+    print("="*80 + "\n")
+    
+    # 1. Assume we have regime analysis done
+    regime_score = 7.8
+    regime_confidence = "HIGH"
+    
+    # 2. Mock option chain data
+    chain = pd.DataFrame({
+        'strike': [23000, 23100, 23200, 23300, 23400, 23500, 23600, 23700, 23800, 23900, 24000],
+        'ce_iv': [18.5, 18.2, 18.0, 17.8, 17.5, 17.3, 17.1, 17.0, 17.2, 17.5, 17.8],
+        'pe_iv': [18.0, 17.8, 17.6, 17.5, 17.8, 18.0, 18.5, 19.0, 19.5, 20.0, 20.5],
+        'ce_delta': [0.85, 0.75, 0.65, 0.55, 0.45, 0.35, 0.25, 0.15, 0.08, 0.03, 0.01],
+        'pe_delta': [-0.01, -0.03, -0.08, -0.15, -0.25, -0.35, -0.45, -0.55, -0.65, -0.75, -0.85],
+        'ce_gamma': [0.0005] * 11,
+        'pe_gamma': [0.0005] * 11,
+        'ce_oi': [50000] * 11,
+        'pe_oi': [60000] * 11,
+        'ce_ltp': [450, 380, 320, 260, 210, 165, 125, 90, 60, 35, 18],
+        'pe_ltp': [15, 30, 55, 85, 120, 160, 205, 255, 315, 380, 450]
+    })
+    
+    spot = 23500
+    dte = 3
+    
+    # 3. Select strikes
+    print("Step 1: Strike Selection")
+    print("-" * 80)
+    
+    strangle = StrikeSelector.select_strangle_strikes(chain, spot, dte, "MODERATE")
+    
+    print(f"Structure: {strangle['structure']}")
+    print(f"Call Strike: {strangle['call_strike']} (₹{strangle['call_premium']})")
+    print(f"Put Strike: {strangle['put_strike']} (₹{strangle['put_premium']})")
+    print(f"Total Premium: ₹{strangle['total_premium']}")
+    print(f"Call ITM Prob: {strangle['call_prob_itm']:.1f}%")
+    print(f"Put ITM Prob: {strangle['put_prob_itm']:.1f}%")
+    
+    # 4. Position sizing
+    print("\nStep 2: Position Sizing")
+    print("-" * 80)
+    
+    sizer = PositionSizer(total_capital=1000000)
+    sizing = sizer.calculate_position_size(strangle, regime_score, regime_confidence)
+    
+    print(f"Kelly Fraction: {sizing['kelly_fraction']:.4f}")
+    print(f"Adjusted Kelly: {sizing['adjusted_kelly']:.4f}")
+    print(f"Lots: {sizing['lots']}")
+    print(f"Capital Allocated: ₹{sizing['capital_allocated']:,.0f}")
+    print(f"Expected Premium: ₹{sizing['expected_premium']:,.0f}")
+    print(f"Total Risk: ₹{sizing['total_risk']:,.0f}")
+    
+    # 5. Monitoring
+    print("\nStep 3: Position Monitoring")
+    print("-" * 80)
+    
+    monitor = PositionMonitor()
+    position = Position(
+        position_id="STRANGLE_20250127",
+        structure="SHORT_STRANGLE",
+        entry_date=date(2025, 1, 27),
+        entry_time="10:15:00",
+        expiry_date=date(2025, 1, 30),
+        dte_at_entry=3,
+        strikes={"call": strangle['call_strike'], "put": strangle['put_strike']},
+        lots=sizing['lots'],
+        lot_size=50,
+        entry_premium=strangle['total_premium'],
+        entry_vix=15.2,
+        entry_spot=23500
+    )
+    
+    monitor.add_position(position)
+    print(f"Position added: {position.position_id}")
+    print(f"Monitoring for exit triggers...")
+    
+    print("\n" + "="*80)
+
+if __name__ == "__main__":
+    example_usage()
